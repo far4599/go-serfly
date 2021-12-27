@@ -189,7 +189,7 @@ func (r *raftConsensusModule) startElection() {
 		Term:        newTerm,
 		CandidateID: r.id,
 	}, &serf.QueryParam{
-		RelayFactor: 0,
+		RelayFactor: 2,
 		Timeout:     RequestVoteTimeout,
 	})
 	if err != nil {

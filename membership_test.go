@@ -36,18 +36,9 @@ func setupMember(t *testing.T, members []*Membership, port int, serviceName stri
 			}
 
 			if role == "leader" {
+				fmt.Printf("==> %s%s became %s on %s\n", svc, id, role, time.Now().Sub(startedAt).String())
+			} else {
 				fmt.Printf("%s%s became %s on %s\n", svc, id, role, time.Now().Sub(startedAt).String())
-
-				//go func() {
-				//	time.Sleep(5 * time.Second)
-				//
-				//	i, _ := strconv.ParseInt(id, 10, 64)
-				//
-				//	fmt.Printf("%s left cluster at %s\n", id, time.Now().Sub(startedAt).String())
-				//
-				//	err := members[i].Stop()
-				//	require.NoError(t, err)
-				//}()
 			}
 		}
 	}
@@ -79,9 +70,11 @@ func TestMembershipThreeNodes(t *testing.T) {
 		m = setupMember(t, m, initPort+i, "")
 	}
 
+	sampleM := m[0]
+
 	// check if leader is elected
 	require.Eventually(t, func() bool {
-		return m[0].ServiceMembers().GetLeader() != nil
+		return sampleM.ServiceMembers().GetLeader() != nil
 	}, 60*time.Second, 250*time.Millisecond)
 
 	time.Sleep(3 * time.Second)
@@ -95,13 +88,17 @@ func TestMembershipThreeNodes(t *testing.T) {
 			err := membership.Stop()
 			require.NoError(t, err)
 
+			if sampleM == membership {
+				sampleM = m[1]
+			}
+
 			break
 		}
 	}
 
 	// check if a new leader is elected
 	require.Eventually(t, func() bool {
-		return m[0].ServiceMembers().GetLeader() != nil
+		return sampleM.ServiceMembers().GetLeader() != nil
 	}, 60*time.Second, 250*time.Millisecond)
 }
 
