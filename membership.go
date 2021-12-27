@@ -168,7 +168,7 @@ func (m *Membership) isLocal(name string) bool {
 }
 
 func (m *Membership) IsLeader() bool {
-	return m.raft.status == RaftStatusLeader
+	return m.raft != nil && m.raft.status == RaftStatusLeader
 }
 
 func (m *Membership) Status() RaftStatus {

@@ -71,7 +71,7 @@ func setupMember(t *testing.T, members []*Membership, port int, serviceName stri
 }
 
 func TestMembershipThreeNodes(t *testing.T) {
-	nodesCount := 5
+	nodesCount := 3
 	initPort := int(50000 + rand.Int31n(10000))
 
 	m := setupMember(t, nil, initPort, "")
@@ -79,11 +79,34 @@ func TestMembershipThreeNodes(t *testing.T) {
 		m = setupMember(t, m, initPort+i, "")
 	}
 
-	time.Sleep(60 * time.Second)
+	// check if leader is elected
+	require.Eventually(t, func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 60*time.Second, 250*time.Millisecond)
+
+	time.Sleep(3 * time.Second)
+
+	leader := m[0].ServiceMembers().GetLeader()
+	for _, membership := range m {
+		if membership.NodeName == leader.Name {
+			fmt.Printf("leader %s leaves the cluster\n", leader.Name)
+
+			// leader leaves the cluster
+			err := membership.Stop()
+			require.NoError(t, err)
+
+			break
+		}
+	}
+
+	// check if a new leader is elected
+	require.Eventually(t, func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 60*time.Second, 250*time.Millisecond)
 }
 
 func TestMembershipManyNodes(t *testing.T) {
-	nodesCount := 50
+	nodesCount := 30 // the more nodes in the cluster, the longer test will last
 	initPort := int(50000 + rand.Int31n(10000))
 
 	m := setupMember(t, nil, initPort, "")
@@ -91,22 +114,40 @@ func TestMembershipManyNodes(t *testing.T) {
 		m = setupMember(t, m, initPort+i, "")
 	}
 
-	time.Sleep(60 * time.Second)
+	// check if leader is elected
+	require.Eventually(t, func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 60*time.Second, 250*time.Millisecond)
 }
 
-func TestMembershipTwoServices(t *testing.T) {
-	nodesCount := 5
+func TestMembershipThreeServices(t *testing.T) {
+	nodesCount := 3
+	serviceCount := 3
 	initPort := int(50000 + rand.Int31n(10000))
-	svc := "service1"
+	serviceMap := make(map[string]struct{}, serviceCount)
 
-	m := setupMember(t, nil, initPort, svc)
-	for i := 1; i < nodesCount; i++ {
-		if i > nodesCount/2 {
-			svc = "service2"
+	var m []*Membership
+	p := 0
+	for i := 0; i < serviceCount; i++ {
+		s := fmt.Sprintf("%s-%d", "service", i)
+		serviceMap[s] = struct{}{}
+
+		for j := 0; j < nodesCount; j++ {
+			m = setupMember(t, m, initPort+p, s)
+			p++
 		}
-
-		m = setupMember(t, m, initPort+i, svc)
 	}
 
-	time.Sleep(60 * time.Second)
+	// check if all services elected leader
+	require.Eventually(t, func() bool {
+		result := true
+
+		for s := range serviceMap {
+			if m[0].AllMembers().GetService(s).GetLeader() == nil {
+				result = false
+			}
+		}
+
+		return result
+	}, 30*time.Second, 250*time.Millisecond)
 }

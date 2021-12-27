@@ -93,6 +93,8 @@ func newRaft(name string, m *Membership, l *zap.Logger) *raftConsensusModule {
 
 	m.AddMessageListener(raftMessageRequestVote, r.handleRequestVote)
 	m.AddMessageListener(raftMessageLeaderHeartbeat, r.handleLeaderHeartbeat)
+	m.AddMemberEventListener(memberEventBecameLeader, r.onBecameLeader)
+	m.AddMemberEventListener(memberEventBecameFollower, r.onBecameFollower)
 
 	go func() {
 		// 3 seconds timeout to let serf complete cluster initialization
@@ -418,4 +420,34 @@ func (r *raftConsensusModule) Stop() {
 	r.mu.Lock()
 	r.status = RaftStatusDead
 	r.mu.Unlock()
+}
+
+func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member) {
+	tags := member.Tags
+
+	if tags == nil {
+		tags = make(map[string]string)
+	}
+
+	tags[LeaderTagName] = "true"
+
+	err := m.serf.SetTags(tags)
+	if err != nil {
+		// log error
+	}
+}
+
+func (r *raftConsensusModule) onBecameFollower(m *Membership, member *serf.Member) {
+	tags := member.Tags
+
+	if tags == nil {
+		return
+	}
+
+	delete(tags, LeaderTagName)
+
+	err := m.serf.SetTags(tags)
+	if err != nil {
+		// log error
+	}
 }

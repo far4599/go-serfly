@@ -1,4 +1,4 @@
-module github.com/far4599/go-raftly
+module github.com/far4599/go-serfly
 
 go 1.17
 

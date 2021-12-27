@@ -27,6 +27,11 @@ func (m *Membership) onMessageHook(msgType string, query *serf.Query) {
 }
 
 func (m *Membership) onMemberEventHook(eventType memberEventType, member *serf.Member) {
+	if member == nil {
+		_m := m.serf.LocalMember()
+		member = &_m
+	}
+
 	for _, fn := range m.memberEventListeners[eventType] {
 		fn(m, member)
 	}
