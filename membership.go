@@ -64,6 +64,7 @@ func (m *Membership) Serve() (err error) {
 
 	config := serf.DefaultConfig()
 	config.Init()
+
 	config.MemberlistConfig.BindAddr = addr.IP.String()
 	config.MemberlistConfig.BindPort = addr.Port
 

@@ -2,7 +2,6 @@ package go_serfly
 
 import (
 	"fmt"
-	"math/rand"
 	"strconv"
 	"testing"
 	"time"
@@ -61,9 +60,29 @@ func setupMember(t *testing.T, members []*Membership, port int, serviceName stri
 	return members
 }
 
+// TestMembershipOneNode tests that is there only one node it will never become a leader
+func TestMembershipOneNode(t *testing.T) {
+	t.Parallel()
+
+	nodesCount := 1
+	initPort := int(50000 + randInt64n(1000))
+
+	m := setupMember(t, nil, initPort, "")
+	for i := 1; i < nodesCount; i++ {
+		m = setupMember(t, m, initPort+i, "")
+	}
+
+	// check leader must never not be elected
+	require.Never(t, func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 5*time.Second, 250*time.Millisecond)
+}
+
 func TestMembershipThreeNodes(t *testing.T) {
+	t.Parallel()
+
 	nodesCount := 3
-	initPort := int(50000 + rand.Int31n(10000))
+	initPort := int(51000 + randInt64n(1000))
 
 	m := setupMember(t, nil, initPort, "")
 	for i := 1; i < nodesCount; i++ {
@@ -103,8 +122,10 @@ func TestMembershipThreeNodes(t *testing.T) {
 }
 
 func TestMembershipManyNodes(t *testing.T) {
-	nodesCount := 30 // the more nodes in the cluster, the longer test will last
-	initPort := int(50000 + rand.Int31n(10000))
+	t.Parallel()
+
+	nodesCount := 15 // the more nodes in the cluster, the longer test will last
+	initPort := int(52000 + randInt64n(1000))
 
 	m := setupMember(t, nil, initPort, "")
 	for i := 1; i < nodesCount; i++ {
@@ -118,9 +139,11 @@ func TestMembershipManyNodes(t *testing.T) {
 }
 
 func TestMembershipThreeServices(t *testing.T) {
+	t.Parallel()
+
 	nodesCount := 3
 	serviceCount := 3
-	initPort := int(50000 + rand.Int31n(10000))
+	initPort := int(53000 + randInt64n(1000))
 	serviceMap := make(map[string]struct{}, serviceCount)
 
 	var m []*Membership
@@ -146,5 +169,5 @@ func TestMembershipThreeServices(t *testing.T) {
 		}
 
 		return result
-	}, 30*time.Second, 250*time.Millisecond)
+	}, 60*time.Second, 250*time.Millisecond)
 }

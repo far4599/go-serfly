@@ -2,7 +2,6 @@ package go_serfly
 
 import (
 	"fmt"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -12,7 +11,6 @@ import (
 )
 
 var (
-	RequestVoteTimeout     = 100 * time.Millisecond
 	LeaderHeartbeatTimeout = 100 * time.Millisecond
 	baseElectionTimeout    = 1000
 	electionTimeoutMeasure = time.Millisecond
@@ -97,8 +95,8 @@ func newRaft(name string, m *Membership, l *zap.Logger) *raftConsensusModule {
 	m.AddMemberEventListener(memberEventBecameFollower, r.onBecameFollower)
 
 	go func() {
-		// 3 seconds timeout to let serf complete cluster initialization
-		time.Sleep(3 * time.Second)
+		// 500 milliseconds timeout to let serf complete cluster initialization
+		time.Sleep(500 * time.Millisecond)
 
 		r.mu.Lock()
 		r.electionResetTime = time.Now()
@@ -180,17 +178,19 @@ func (r *raftConsensusModule) startElection() {
 
 	peersCount := r.membership.ServiceMembers().CountActive()
 
+	// if member is alone, it cannot become a leader
 	if peersCount == 1 {
-		r.startLeader()
 		return
 	}
 
+	timeout := queryTimeout(r.membership.ServiceMembers().CountActive()) / 5
+
+	fmt.Printf("%s election started with timeout %s\n", r.id, timeout.String())
 	respCh, err := r.membership.Broadcast(raftMessageRequestVote, RequestVoteReq{
 		Term:        newTerm,
 		CandidateID: r.id,
 	}, &serf.QueryParam{
-		RelayFactor: 2,
-		Timeout:     RequestVoteTimeout,
+		Timeout: timeout,
 	})
 	if err != nil {
 		return
@@ -213,15 +213,19 @@ func (r *raftConsensusModule) startElection() {
 			return
 		} else if resp.Term == newTerm {
 			if resp.VoteGranted {
+				fmt.Printf("%s voted for %s\n", reply.FromID, r.id)
 				votesCount += 1
 				if votesCount*2 > peersCount+1 {
 					// Won the election!
 					r.startLeader()
 					return
 				}
+			} else {
+				fmt.Printf("%s voted NOT for %s\n", reply.FromID, r.id)
 			}
 		}
 	}
+	fmt.Printf("%s election finished\n", r.id)
 }
 
 // startLeader switches module into a leader state and begins process of heartbeats.
@@ -239,14 +243,14 @@ func (r *raftConsensusModule) startLeader() {
 
 		// Send periodic heartbeats, as long as still leader.
 		for time.Now(); true; <-ticker.C {
-			r.leaderSendHeartbeats()
-
 			r.mu.Lock()
 			if r.status != RaftStatusLeader {
 				r.mu.Unlock()
 				return
 			}
 			r.mu.Unlock()
+
+			r.leaderSendHeartbeats()
 		}
 	}()
 }
@@ -275,8 +279,7 @@ func (r *raftConsensusModule) leaderSendHeartbeats() {
 		Term:     currentTerm,
 		LeaderID: r.id,
 	}, &serf.QueryParam{
-		RelayFactor: 0,
-		Timeout:     LeaderHeartbeatTimeout,
+		Timeout: LeaderHeartbeatTimeout,
 	})
 
 	checkReply := func(resp RequestVoteResp) bool {
@@ -402,24 +405,28 @@ func (r *raftConsensusModule) handleRequestVote(_ *Membership, query *serf.Query
 	}
 }
 
-// electionTimeout generates a pseudo-random election timeout duration.
+// electionTimeout generates a random election timeout duration.
 func (r *raftConsensusModule) electionTimeout() time.Duration {
-	dynamicTimeout := r.membership.serf.DefaultQueryTimeout() / 6
-
-	timeout := dynamicTimeout + time.Duration(rand.Intn(baseElectionTimeout))*electionTimeoutMeasure
+	var timeout time.Duration
 
 	r.once.Do(func() {
-		timeout = time.Duration(150+rand.Intn(baseElectionTimeout)) * electionTimeoutMeasure
+		timeout = time.Duration(150+randInt64n(int64(baseElectionTimeout))) * electionTimeoutMeasure
 	})
 
-	return timeout
+	if timeout != 0 {
+		return timeout
+	}
+
+	timeout = queryTimeout(r.membership.ServiceMembers().CountActive())
+	return timeout + time.Duration(randInt64n(int64(baseElectionTimeout)))*electionTimeoutMeasure
 }
 
 // Stop stops raft module
 func (r *raftConsensusModule) Stop() {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.status = RaftStatusDead
-	r.mu.Unlock()
 }
 
 func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member) {
