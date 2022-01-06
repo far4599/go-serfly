@@ -27,9 +27,10 @@ type BroadcastMessageResp struct {
 type Membership struct {
 	Config
 
-	serf   *serf.Serf
-	raft   *raftConsensusModule
-	logger *zap.Logger
+	serf          *serf.Serf
+	raft          *raftConsensusModule
+	raftTransport RaftTransport
+	logger        *zap.Logger
 
 	serviceName string
 
@@ -68,8 +69,8 @@ func (m *Membership) Serve() (err error) {
 	config.MemberlistConfig.BindAddr = addr.IP.String()
 	config.MemberlistConfig.BindPort = addr.Port
 
-	config.MemberlistConfig.Logger = zap.NewStdLog(m.logger)
-	config.Logger = zap.NewStdLog(m.logger)
+	config.MemberlistConfig.Logger = zap.NewStdLog(zap.NewNop())
+	config.Logger = zap.NewStdLog(zap.NewNop())
 
 	m.eventsCh = make(chan serf.Event)
 	config.EventCh = m.eventsCh
@@ -81,7 +82,7 @@ func (m *Membership) Serve() (err error) {
 		return err
 	}
 
-	m.raft = newRaft(m.serf.LocalMember().Name, m, m.logger)
+	m.raft = newRaft(m.serf.LocalMember().Name, m, m.raftTransport, m.logger)
 
 	go m.eventHandler()
 

@@ -1,30 +1,20 @@
 package go_serfly
 
 import (
-	"fmt"
+	"context"
 	"sync"
 	"time"
 
+	"github.com/far4599/go-serfly/types"
 	"github.com/hashicorp/serf/serf"
-	jsoniter "github.com/json-iterator/go"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
-)
-
-var (
-	LeaderHeartbeatTimeout = 100 * time.Millisecond
-	baseElectionTimeout    = 1000
-	electionTimeoutMeasure = time.Millisecond
-)
-
-const (
-	raftMessageRequestVote     = "requestVote"
-	raftMessageLeaderHeartbeat = "leaderHeartbeat"
 )
 
 type RaftStatus int8
 
 const (
-	RaftStatusFollower = iota
+	RaftStatusFollower RaftStatus = iota
 	RaftStatusCandidate
 	RaftStatusLeader
 	RaftStatusDead
@@ -45,29 +35,11 @@ func (s RaftStatus) String() string {
 	}
 }
 
-type RequestVoteReq struct {
-	Term        int
-	CandidateID string
-}
-
-type RequestVoteResp struct {
-	Term        int
-	VoteGranted bool
-	CandidateID string
-}
-
-type LeaderHeartbeatReq struct {
-	Term     int
-	LeaderID string
-}
-
-type LeaderHeartbeatResp struct {
-	Term int
-}
-
 type raftConsensusModule struct {
 	membership *Membership
 	logger     *zap.Logger
+
+	transport RaftTransport
 
 	id                string
 	currentTerm       int
@@ -79,25 +51,45 @@ type raftConsensusModule struct {
 	once sync.Once
 }
 
-func newRaft(name string, m *Membership, l *zap.Logger) *raftConsensusModule {
+func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger) *raftConsensusModule {
+	if l == nil {
+		l = zap.NewNop()
+	}
+
+	if t == nil {
+		l.Fatal("raft transport is not set")
+	}
+
 	r := &raftConsensusModule{
 		id:          name,
 		currentTerm: -1,
 		votedForID:  "",
 		status:      RaftStatusFollower,
 		membership:  m,
-		logger:      l,
+
+		transport: t,
+
+		logger: l,
 	}
 
-	m.AddMessageListener(raftMessageRequestVote, r.handleRequestVote)
-	m.AddMessageListener(raftMessageLeaderHeartbeat, r.handleLeaderHeartbeat)
 	m.AddMemberEventListener(memberEventBecameLeader, r.onBecameLeader)
 	m.AddMemberEventListener(memberEventBecameFollower, r.onBecameFollower)
 
-	go func() {
-		// 500 milliseconds timeout to let serf complete cluster initialization
-		time.Sleep(500 * time.Millisecond)
+	if err := t.SetLeaderHeartbeatHandler(r.handleLeaderHeartbeat); err != nil {
+		l.Fatal("failed to LeaderHeartbeatHandler", zap.Error(err))
+	}
 
+	if err := t.SetRequestVoteHandler(r.handleRequestVote); err != nil {
+		l.Fatal("failed to SetRequestVoteHandler", zap.Error(err))
+	}
+
+	go func() {
+		if err := t.Start(); err != nil {
+			l.Fatal("raft transport failed to start", zap.Error(err))
+		}
+	}()
+
+	go func() {
 		r.mu.Lock()
 		r.electionResetTime = time.Now()
 		r.mu.Unlock()
@@ -119,14 +111,6 @@ func (r *raftConsensusModule) runElectionTimer() {
 	r.mu.Lock()
 	initialTerm := r.currentTerm
 	r.mu.Unlock()
-
-	// This loops until either:
-	// - we discover the election timer is no longer needed, or
-	// - the election timer expires and this module becomes a candidate
-	// In a follower, this typically keeps running in the background for the
-	// duration of the module's lifetime.
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
 
 	checkElectionLoop := func() (exitLoop bool) {
 		r.mu.Lock()
@@ -150,7 +134,8 @@ func (r *raftConsensusModule) runElectionTimer() {
 		return false
 	}
 
-	checkElectionLoop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 
 	for time.Now(); true; <-ticker.C {
 		if checkElectionLoop() {
@@ -174,58 +159,54 @@ func (r *raftConsensusModule) startElection() {
 
 	go r.membership.onMemberEventHook(memberEventBecameCandidate, nil)
 
-	votesCount := 1
-
-	peersCount := r.membership.ServiceMembers().CountActive()
+	peers := r.membership.ServiceMembers().Active()
 
 	// if member is alone, it cannot become a leader
-	if peersCount == 1 {
+	if len(peers) == 1 {
 		return
 	}
 
-	timeout := queryTimeout(r.membership.ServiceMembers().CountActive()) / 5
-
-	fmt.Printf("%s election started with timeout %s\n", r.id, timeout.String())
-	respCh, err := r.membership.Broadcast(raftMessageRequestVote, RequestVoteReq{
+	req := types.RequestVoteReq{
 		Term:        newTerm,
 		CandidateID: r.id,
-	}, &serf.QueryParam{
-		Timeout: timeout,
-	})
-	if err != nil {
-		return
 	}
 
-	for reply := range respCh {
-		var resp RequestVoteResp
-		err = jsoniter.Unmarshal(reply.Payload, &resp)
-		if err != nil {
-			return
+	var votesCount atomic.Uint32
+	votesCount.Store(1)
+	for _, peer := range peers {
+		if peer.Name == r.id {
+			continue
 		}
 
-		if r.status != RaftStatusCandidate {
-			return
-		}
+		go func(peer serf.Member) {
+			ctx, cancelCtx := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancelCtx()
 
-		if resp.Term > newTerm {
-			fmt.Printf("elevtion dropped: collected %d votes, but term raised", votesCount)
-			r.becomeFollower(resp.Term)
-			return
-		} else if resp.Term == newTerm {
-			if resp.VoteGranted {
-				fmt.Printf("%s voted for %s\n", reply.FromID, r.id)
-				votesCount += 1
-				if votesCount*2 > peersCount+1 {
-					// Won the election!
-					r.startLeader()
-					return
-				}
-			} else {
-				fmt.Printf("%s voted NOT for %s\n", reply.FromID, r.id)
+			resp, err := r.transport.SendVoteRequest(ctx, peer, req)
+			if err != nil {
+				return
 			}
-		}
+
+			if r.status != RaftStatusCandidate {
+				return
+			}
+
+			if resp.Term > newTerm {
+				r.logger.Debug("resp term is greater than new term", zap.Int("respTerm", resp.Term), zap.Int("newTerm", newTerm))
+				r.becomeFollower(resp.Term)
+				return
+			} else if resp.Term == newTerm {
+				if resp.VoteGranted {
+					votesCount.Add(1)
+					if int(votesCount.Load())*2 > len(peers)+1 {
+						// Won the election!
+						r.startLeader()
+						return
+					}
+				}
+			}
+		}(peer)
 	}
-	fmt.Printf("%s election finished\n", r.id)
 }
 
 // startLeader switches module into a leader state and begins process of heartbeats.
@@ -238,8 +219,6 @@ func (r *raftConsensusModule) startLeader() {
 	go func() {
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
-
-		r.leaderSendHeartbeats()
 
 		// Send periodic heartbeats, as long as still leader.
 		for time.Now(); true; <-ticker.C {
@@ -275,111 +254,88 @@ func (r *raftConsensusModule) leaderSendHeartbeats() {
 	currentTerm := r.currentTerm
 	r.mu.Unlock()
 
-	respCh, _ := r.membership.Broadcast(raftMessageLeaderHeartbeat, LeaderHeartbeatReq{
-		Term:     currentTerm,
-		LeaderID: r.id,
-	}, &serf.QueryParam{
-		Timeout: LeaderHeartbeatTimeout,
-	})
+	peers := r.membership.ServiceMembers().Active()
 
-	checkReply := func(resp RequestVoteResp) bool {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-
-		if resp.Term > currentTerm {
-			r.becomeFollower(resp.Term)
-			return true
-		}
-
-		return false
+	if len(peers) <= 1 {
+		return
 	}
 
-	for reply := range respCh {
-		var resp RequestVoteResp
-		err := jsoniter.Unmarshal(reply.Payload, &resp)
-		if err != nil {
+	req := types.LeaderHeartbeatReq{
+		Term:     currentTerm,
+		LeaderID: r.id,
+	}
+
+	for _, peer := range peers {
+		peer := peer
+
+		if peer.Name == r.id {
 			continue
 		}
 
-		if checkReply(resp) {
-			break
-		}
+		go func() {
+
+			ctx, cancelCtx := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancelCtx()
+
+			resp, err := r.transport.SendLeaderHeartbeat(ctx, peer, req)
+			if err != nil {
+				return
+			}
+
+			r.mu.Lock()
+			defer r.mu.Unlock()
+
+			if resp.Term > currentTerm {
+				r.logger.Debug("resp term is greater than currentTerm", zap.Int("respTerm", resp.Term), zap.Int("currentTerm", currentTerm))
+				cancelCtx()
+				r.becomeFollower(resp.Term)
+			}
+		}()
 	}
 }
 
-func (r *raftConsensusModule) handleLeaderHeartbeat(_ *Membership, query *serf.Query) {
+func (r *raftConsensusModule) handleLeaderHeartbeat(_ context.Context, req types.LeaderHeartbeatReq) (*types.LeaderHeartbeatResp, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	if r.status == RaftStatusDead {
-		r.mu.Unlock()
-		return
-	}
-
-	var req LeaderHeartbeatReq
-	err := jsoniter.Unmarshal(query.Payload, &req)
-	if err != nil {
-		r.mu.Unlock()
-		return
-	}
-
-	if req.LeaderID == r.id {
-		r.mu.Unlock()
-		return
+		return nil, nil
 	}
 
 	if req.Term > r.currentTerm {
+		r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("currentTerm", r.currentTerm))
 		r.becomeFollower(req.Term)
 	}
 
-	resp := LeaderHeartbeatResp{
+	resp := &types.LeaderHeartbeatResp{
 		Term: r.currentTerm,
 	}
 
 	if req.Term == r.currentTerm {
 		if r.status != RaftStatusFollower {
+			r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("currentTerm", r.currentTerm), zap.String("id", r.id), zap.String("leaderID", req.LeaderID))
 			r.becomeFollower(req.Term)
 		}
 		r.electionResetTime = time.Now()
 	}
 
-	r.mu.Unlock()
-
-	respJSON, err := jsoniter.Marshal(resp)
-	if err != nil {
-		return
-	}
-
-	err = query.Respond(respJSON)
-	if err != nil {
-		return
-	}
+	return resp, nil
 }
 
-func (r *raftConsensusModule) handleRequestVote(_ *Membership, query *serf.Query) {
+func (r *raftConsensusModule) handleRequestVote(_ context.Context, req types.RequestVoteReq) (*types.RequestVoteResp, error) {
 	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	if r.status == RaftStatusDead {
-		r.mu.Unlock()
-		return
-	}
-
-	var req RequestVoteReq
-	err := jsoniter.Unmarshal(query.Payload, &req)
-	if err != nil {
-		r.mu.Unlock()
-		return
-	}
-
-	if req.CandidateID == r.id {
-		r.mu.Unlock()
-		return
+		return nil, nil
 	}
 
 	if req.Term > r.currentTerm {
+		r.logger.Debug("req term is greater than current term", zap.Int("reqTerm", req.Term), zap.Int("currentTerm", r.currentTerm))
 		r.becomeFollower(req.Term)
 	}
 
-	resp := RequestVoteResp{
+	resp := &types.RequestVoteResp{
 		Term: r.currentTerm,
 	}
 
@@ -392,41 +348,18 @@ func (r *raftConsensusModule) handleRequestVote(_ *Membership, query *serf.Query
 		resp.VoteGranted = false
 	}
 
-	r.mu.Unlock()
-
-	respJSON, err := jsoniter.Marshal(resp)
-	if err != nil {
-		return
-	}
-
-	err = query.Respond(respJSON)
-	if err != nil {
-		return
-	}
-}
-
-// electionTimeout generates a random election timeout duration.
-func (r *raftConsensusModule) electionTimeout() time.Duration {
-	var timeout time.Duration
-
-	r.once.Do(func() {
-		timeout = time.Duration(150+randInt64n(int64(baseElectionTimeout))) * electionTimeoutMeasure
-	})
-
-	if timeout != 0 {
-		return timeout
-	}
-
-	timeout = queryTimeout(r.membership.ServiceMembers().CountActive())
-	return timeout + time.Duration(randInt64n(int64(baseElectionTimeout)))*electionTimeoutMeasure
+	return resp, nil
 }
 
 // Stop stops raft module
 func (r *raftConsensusModule) Stop() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.status = RaftStatusDead
+	r.mu.Unlock()
+
+	if err := r.transport.Stop(); err != nil {
+		r.logger.Error("failed to stop raft transport", zap.Error(err))
+	}
 }
 
 func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member) {
@@ -457,4 +390,9 @@ func (r *raftConsensusModule) onBecameFollower(m *Membership, member *serf.Membe
 	if err != nil {
 		// log error
 	}
+}
+
+// electionTimeout generates a random election timeout duration.
+func (r *raftConsensusModule) electionTimeout() time.Duration {
+	return time.Duration(150+randInt64n(int64(150))) * time.Millisecond
 }

@@ -23,6 +23,14 @@ func WithServiceName(serviceName string) func(membership *Membership) error {
 	}
 }
 
+func WithRaftTransport(t RaftTransport) func(membership *Membership) error {
+	return func(membership *Membership) error {
+		membership.raftTransport = t
+		membership.Config.Tags = t.AddTransportTags(membership.Config.Tags)
+		return nil
+	}
+}
+
 func WithOnMemberJoinCallback(fn func(*Membership, *serf.Member)) func(membership *Membership) error {
 	return func(membership *Membership) error {
 		membership.AddMemberEventListener(memberEventJoin, fn)

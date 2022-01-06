@@ -6,12 +6,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/far4599/go-serfly/transport"
 	"github.com/hashicorp/serf/serf"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 )
 
-func setupMember(t *testing.T, members []*Membership, port int, serviceName string) []*Membership {
+func setupMember(t *testing.T, members []*Membership, port, transportPort int, serviceName string) []*Membership {
 	id := len(members)
 	addr := fmt.Sprintf("%s:%d", "127.0.0.1", port)
 	c := Config{
@@ -44,12 +45,12 @@ func setupMember(t *testing.T, members []*Membership, port int, serviceName stri
 
 	i := strconv.Itoa(id)
 
-	//logger, err := zap.NewDevelopment()
-	//require.NoError(t, err)
+	logger, err := zap.NewDevelopment()
+	require.NoError(t, err)
 
-	logger := zap.NewNop()
+	tr := transport.NewHttpTransport("127.0.0.1", transportPort, nil, logger)
 
-	m, err := New(c, WithOnBecomeLeaderCallback(on(i, "leader")), WithOnBecomeFollowerCallback(on(i, "follower")), WithOnBecomeCandidateCallback(on(i, "candidate")), WithLogger(logger), WithServiceName(serviceName))
+	m, err := New(c, WithOnBecomeLeaderCallback(on(i, "leader")), WithOnBecomeFollowerCallback(on(i, "follower")), WithOnBecomeCandidateCallback(on(i, "candidate")), WithLogger(logger), WithServiceName(serviceName), WithRaftTransport(tr))
 	require.NoError(t, err)
 
 	err = m.Serve()
@@ -67,9 +68,9 @@ func TestMembershipOneNode(t *testing.T) {
 	nodesCount := 1
 	initPort := int(50000 + randInt64n(1000))
 
-	m := setupMember(t, nil, initPort, "")
+	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, "")
+		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
 	}
 
 	// check leader must never not be elected
@@ -78,15 +79,32 @@ func TestMembershipOneNode(t *testing.T) {
 	}, 5*time.Second, 250*time.Millisecond)
 }
 
+func TestMembershipTwoNodes(t *testing.T) {
+	t.Parallel()
+
+	nodesCount := 3
+	initPort := int(51500 + randInt64n(500))
+
+	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
+	for i := 1; i < nodesCount; i++ {
+		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
+	}
+
+	// check if leader is elected
+	require.Eventually(t, func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 60*time.Second, 250*time.Millisecond)
+}
+
 func TestMembershipThreeNodes(t *testing.T) {
 	t.Parallel()
 
 	nodesCount := 3
 	initPort := int(51000 + randInt64n(1000))
 
-	m := setupMember(t, nil, initPort, "")
+	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, "")
+		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
 	}
 
 	sampleM := m[0]
@@ -127,9 +145,9 @@ func TestMembershipManyNodes(t *testing.T) {
 	nodesCount := 15 // the more nodes in the cluster, the longer test will last
 	initPort := int(52000 + randInt64n(1000))
 
-	m := setupMember(t, nil, initPort, "")
+	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, "")
+		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
 	}
 
 	// check if leader is elected
@@ -153,7 +171,7 @@ func TestMembershipThreeServices(t *testing.T) {
 		serviceMap[s] = struct{}{}
 
 		for j := 0; j < nodesCount; j++ {
-			m = setupMember(t, m, initPort+p, s)
+			m = setupMember(t, m, initPort+p, initPort+p+nodesCount*serviceCount, s)
 			p++
 		}
 	}

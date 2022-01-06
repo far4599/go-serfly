@@ -25,6 +25,18 @@ func (mm Members) CountActive() int {
 	return count
 }
 
+func (mm Members) Active() Members {
+	var members []serf.Member
+
+	for _, m := range mm {
+		if m.Status == serf.StatusAlive {
+			members = append(members, m)
+		}
+	}
+
+	return members
+}
+
 func (mm Members) GetService(serviceName string) Members {
 	var members []serf.Member
 
