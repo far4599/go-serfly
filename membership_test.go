@@ -16,13 +16,13 @@ func setupMember(t *testing.T, members []*Membership, port, transportPort int, s
 	id := len(members)
 	addr := fmt.Sprintf("%s:%d", "127.0.0.1", port)
 	c := Config{
-		NodeName: fmt.Sprintf("%d", id),
-		BindAddr: addr,
+		Name: fmt.Sprintf("%d", id),
+		Addr: addr,
 	}
 
 	if len(members) > 0 {
 		c.KnownClusterAddresses = []string{
-			members[0].BindAddr,
+			members[0].Addr,
 		}
 	}
 
@@ -50,7 +50,7 @@ func setupMember(t *testing.T, members []*Membership, port, transportPort int, s
 
 	tr := transport.NewHttpTransport("127.0.0.1", transportPort, nil, logger)
 
-	m, err := New(c, WithOnBecomeLeaderCallback(on(i, "leader")), WithOnBecomeFollowerCallback(on(i, "follower")), WithOnBecomeCandidateCallback(on(i, "candidate")), WithLogger(logger), WithServiceName(serviceName), WithRaftTransport(tr))
+	m, err := NewMembership(c, WithOnBecomeLeaderCallback(on(i, "leader")), WithOnBecomeFollowerCallback(on(i, "follower")), WithOnBecomeCandidateCallback(on(i, "candidate")), WithLogger(logger), WithServiceName(serviceName), WithRaftTransport(tr))
 	require.NoError(t, err)
 
 	err = m.Serve()
@@ -118,7 +118,7 @@ func TestMembershipThreeNodes(t *testing.T) {
 
 	leader := m[0].ServiceMembers().GetLeader()
 	for _, membership := range m {
-		if membership.NodeName == leader.Name {
+		if membership.Name == leader.Name {
 			fmt.Printf("leader %s leaves the cluster\n", leader.Name)
 
 			// leader leaves the cluster
@@ -160,7 +160,7 @@ func TestMembershipThreeServices(t *testing.T) {
 	t.Parallel()
 
 	nodesCount := 3
-	serviceCount := 3
+	serviceCount := 5
 	initPort := int(53000 + randInt64n(1000))
 	serviceMap := make(map[string]struct{}, serviceCount)
 

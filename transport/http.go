@@ -1,3 +1,5 @@
+// Implementation of http raft transport.
+
 package transport
 
 import (
@@ -104,6 +106,7 @@ func (h *HttpTransport) SetLeaderHeartbeatHandler(f func(ctx context.Context, re
 	return nil
 }
 
+// AddTransportTags adds tag with peer address
 func (h *HttpTransport) AddTransportTags(tags map[string]string) map[string]string {
 	if tags == nil {
 		tags = make(map[string]string)
@@ -112,6 +115,7 @@ func (h *HttpTransport) AddTransportTags(tags map[string]string) map[string]stri
 	return tags
 }
 
+// Start starts the http server
 func (h *HttpTransport) Start() error {
 	h.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", h.addr, h.port),
@@ -125,6 +129,7 @@ func (h *HttpTransport) Start() error {
 	return nil
 }
 
+// Stop gracefully shuts down server
 func (h *HttpTransport) Stop() error {
 	ctx, cancelCtx := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelCtx()
@@ -137,6 +142,7 @@ func (h *HttpTransport) Stop() error {
 	return nil
 }
 
+// GetRouter is a getter of mux to modify it if needed
 func (h *HttpTransport) GetRouter() *mux.Router {
 	return h.router
 }

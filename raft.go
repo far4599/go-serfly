@@ -1,3 +1,8 @@
+// This is a raft-like consensus module implementation. It is based on raft.
+// Actually it is used for leader election only. There is no log and log
+// replication at all. So all the nodes in the cluster has the same chances to
+// become a leader.
+
 package go_serfly
 
 import (
@@ -11,69 +16,49 @@ import (
 	"go.uber.org/zap"
 )
 
-type RaftStatus int8
-
 const (
-	RaftStatusFollower RaftStatus = iota
-	RaftStatusCandidate
-	RaftStatusLeader
-	RaftStatusDead
+	electionTimeout               = 150
+	runElectionTimerInterval      = 20 * time.Millisecond
+	leaderHeartbeatsTimerInterval = 10 * time.Millisecond
 )
-
-func (s RaftStatus) String() string {
-	switch s {
-	case RaftStatusFollower:
-		return "Follower"
-	case RaftStatusCandidate:
-		return "Candidate"
-	case RaftStatusLeader:
-		return "Leader"
-	case RaftStatusDead:
-		return "Dead"
-	default:
-		panic("unreachable")
-	}
-}
 
 type raftConsensusModule struct {
 	membership *Membership
-	logger     *zap.Logger
+	transport  RaftTransport
 
-	transport RaftTransport
+	id                string    // current cluster node name
+	term              int       // current raft term
+	votedForID        string    // id of the member this node voted for
+	electionResetTime time.Time // the last time we reset election timer
+	status            types.RaftStatus
 
-	id                string
-	currentTerm       int
-	votedForID        string
-	electionResetTime time.Time
-	status            RaftStatus
-
-	mu   sync.Mutex
-	once sync.Once
+	logger *zap.Logger
+	mutex  sync.Mutex
 }
 
+// newRaft is a constructor of a new raft consensus module
 func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger) *raftConsensusModule {
 	if l == nil {
 		l = zap.NewNop()
 	}
 
 	if t == nil {
-		l.Fatal("raft transport is not set")
+		l.Fatal("raft transport implementation is not provided")
 	}
 
 	r := &raftConsensusModule{
-		id:          name,
-		currentTerm: -1,
-		votedForID:  "",
-		status:      RaftStatusFollower,
-		membership:  m,
-
-		transport: t,
-
-		logger: l,
+		id:         name,
+		term:       -1,
+		votedForID: "",
+		status:     types.RaftStatusFollower,
+		membership: m,
+		transport:  t,
+		logger:     l,
 	}
 
-	m.AddMemberEventListener(memberEventBecameLeader, r.onBecameLeader)
-	m.AddMemberEventListener(memberEventBecameFollower, r.onBecameFollower)
+	// custom handler for local member events
+	m.AddMemberEventListener(types.MemberEventBecameLeader, r.onBecameLeader)
+	m.AddMemberEventListener(types.MemberEventBecameFollower, r.onBecameFollower)
 
 	if err := t.SetLeaderHeartbeatHandler(r.handleLeaderHeartbeat); err != nil {
 		l.Fatal("failed to LeaderHeartbeatHandler", zap.Error(err))
@@ -90,42 +75,38 @@ func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger) *raftCo
 	}()
 
 	go func() {
-		r.mu.Lock()
+		r.mutex.Lock()
 		r.electionResetTime = time.Now()
-		r.mu.Unlock()
+		r.mutex.Unlock()
 		r.runElectionTimer()
 	}()
 
 	return r
 }
 
-// runElectionTimer implements an election timer. It should be launched whenever
+// runElectionTimer implements an election timer. it should be launched whenever
 // we want to start a timer towards becoming a candidate in a new election.
-//
-// This function is blocking and should be launched in a separate goroutine;
-// it's designed to work for a single (one-shot) election timer, as it exits
-// whenever the module state changes from follower/candidate or the term changes.
 func (r *raftConsensusModule) runElectionTimer() {
 	timeoutDuration := r.electionTimeout()
 
-	r.mu.Lock()
-	initialTerm := r.currentTerm
-	r.mu.Unlock()
+	r.mutex.Lock()
+	initialTerm := r.term
+	r.mutex.Unlock()
 
 	checkElectionLoop := func() (exitLoop bool) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
+		r.mutex.Lock()
+		defer r.mutex.Unlock()
 
-		if r.status != RaftStatusCandidate && r.status != RaftStatusFollower {
+		if r.status != types.RaftStatusCandidate && r.status != types.RaftStatusFollower {
 			return true
 		}
 
-		if initialTerm != r.currentTerm {
+		if initialTerm != r.term {
 			return true
 		}
 
-		// Start an election if we haven't heard from a leader or haven't voted for
-		// someone for the duration of the timeout.
+		// start a new election if we haven't heard heartbeats from a leader or
+		// haven't voted for someone for the duration of the timeout
 		if elapsed := time.Since(r.electionResetTime); elapsed >= timeoutDuration {
 			r.startElection()
 			return true
@@ -134,7 +115,7 @@ func (r *raftConsensusModule) runElectionTimer() {
 		return false
 	}
 
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(runElectionTimerInterval)
 	defer ticker.Stop()
 
 	for time.Now(); true; <-ticker.C {
@@ -144,27 +125,27 @@ func (r *raftConsensusModule) runElectionTimer() {
 	}
 }
 
-// startElection starts a new election with this module as a candidate.
-// Expects module.mu to be locked.
+// startElection starts a new election with this member as a candidate.
+// expects mutex to be locked.
 func (r *raftConsensusModule) startElection() {
 	defer func() {
 		go r.runElectionTimer()
 	}()
 
-	r.status = RaftStatusCandidate
-	r.votedForID = r.id
-	newTerm := r.currentTerm + 1
-	r.currentTerm = newTerm
-	r.electionResetTime = time.Now()
-
-	go r.membership.onMemberEventHook(memberEventBecameCandidate, nil)
-
 	peers := r.membership.ServiceMembers().Active()
 
 	// if member is alone, it cannot become a leader
-	if len(peers) == 1 {
+	if len(peers) <= 1 {
 		return
 	}
+
+	r.status = types.RaftStatusCandidate
+	r.votedForID = r.id
+	newTerm := r.term + 1
+	r.term = newTerm
+	r.electionResetTime = time.Now()
+
+	go r.membership.onMemberEventHook(types.MemberEventBecameCandidate, nil)
 
 	req := types.RequestVoteReq{
 		Term:        newTerm,
@@ -187,7 +168,7 @@ func (r *raftConsensusModule) startElection() {
 				return
 			}
 
-			if r.status != RaftStatusCandidate {
+			if r.status != types.RaftStatusCandidate {
 				return
 			}
 
@@ -210,49 +191,48 @@ func (r *raftConsensusModule) startElection() {
 }
 
 // startLeader switches module into a leader state and begins process of heartbeats.
-// Expects module.mu to be locked.
+// expects mutex to be locked.
 func (r *raftConsensusModule) startLeader() {
-	r.status = RaftStatusLeader
+	r.status = types.RaftStatusLeader
 
-	go r.membership.onMemberEventHook(memberEventBecameLeader, nil)
+	go r.membership.onMemberEventHook(types.MemberEventBecameLeader, nil)
 
 	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(leaderHeartbeatsTimerInterval)
 		defer ticker.Stop()
 
-		// Send periodic heartbeats, as long as still leader.
+		// send periodic heartbeats as long as member is a leader
 		for time.Now(); true; <-ticker.C {
-			r.mu.Lock()
-			if r.status != RaftStatusLeader {
-				r.mu.Unlock()
+			r.mutex.Lock()
+			if r.status != types.RaftStatusLeader {
+				r.mutex.Unlock()
 				return
 			}
-			r.mu.Unlock()
+			r.mutex.Unlock()
 
 			r.leaderSendHeartbeats()
 		}
 	}()
 }
 
-// becomeFollower makes module a follower and resets its state.
-// Expects module.mu to be locked.
+// becomeFollower switches module into a follower state and resets module state.
+// expects mutex to be locked.
 func (r *raftConsensusModule) becomeFollower(term int) {
-	r.status = RaftStatusFollower
-	r.currentTerm = term
+	r.status = types.RaftStatusFollower
+	r.term = term
 	r.votedForID = ""
 	r.electionResetTime = time.Now()
 
-	go r.membership.onMemberEventHook(memberEventBecameFollower, nil)
+	go r.membership.onMemberEventHook(types.MemberEventBecameFollower, nil)
 
 	go r.runElectionTimer()
 }
 
-// leaderSendHeartbeats sends a round of heartbeats to all peerIDs, collects their
-// replies and adjusts module's state.
+// leaderSendHeartbeats sends heartbeats to all service members in the cluster
 func (r *raftConsensusModule) leaderSendHeartbeats() {
-	r.mu.Lock()
-	currentTerm := r.currentTerm
-	r.mu.Unlock()
+	r.mutex.Lock()
+	currentTerm := r.term
+	r.mutex.Unlock()
 
 	peers := r.membership.ServiceMembers().Active()
 
@@ -282,11 +262,11 @@ func (r *raftConsensusModule) leaderSendHeartbeats() {
 				return
 			}
 
-			r.mu.Lock()
-			defer r.mu.Unlock()
+			r.mutex.Lock()
+			defer r.mutex.Unlock()
 
 			if resp.Term > currentTerm {
-				r.logger.Debug("resp term is greater than currentTerm", zap.Int("respTerm", resp.Term), zap.Int("currentTerm", currentTerm))
+				r.logger.Debug("resp term is greater than term", zap.Int("respTerm", resp.Term), zap.Int("term", currentTerm))
 				cancelCtx()
 				r.becomeFollower(resp.Term)
 			}
@@ -294,26 +274,27 @@ func (r *raftConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
+// handleLeaderHeartbeat is a handler for RaftTransport.SetLeaderHeartbeatHandler
 func (r *raftConsensusModule) handleLeaderHeartbeat(_ context.Context, req types.LeaderHeartbeatReq) (*types.LeaderHeartbeatResp, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
-	if r.status == RaftStatusDead {
+	if r.status == types.RaftStatusDead {
 		return nil, nil
 	}
 
-	if req.Term > r.currentTerm {
-		r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("currentTerm", r.currentTerm))
+	if req.Term > r.term {
+		r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("term", r.term))
 		r.becomeFollower(req.Term)
 	}
 
 	resp := &types.LeaderHeartbeatResp{
-		Term: r.currentTerm,
+		Term: r.term,
 	}
 
-	if req.Term == r.currentTerm {
-		if r.status != RaftStatusFollower {
-			r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("currentTerm", r.currentTerm), zap.String("id", r.id), zap.String("leaderID", req.LeaderID))
+	if req.Term == r.term {
+		if r.status != types.RaftStatusFollower {
+			r.logger.Debug("new term in leader heartbeat", zap.Int("newTerm", req.Term), zap.Int("term", r.term), zap.String("id", r.id), zap.String("leaderID", req.LeaderID))
 			r.becomeFollower(req.Term)
 		}
 		r.electionResetTime = time.Now()
@@ -322,24 +303,25 @@ func (r *raftConsensusModule) handleLeaderHeartbeat(_ context.Context, req types
 	return resp, nil
 }
 
+// handleRequestVote is a handler for RaftTransport.SetRequestVoteHandler
 func (r *raftConsensusModule) handleRequestVote(_ context.Context, req types.RequestVoteReq) (*types.RequestVoteResp, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 
-	if r.status == RaftStatusDead {
+	if r.status == types.RaftStatusDead {
 		return nil, nil
 	}
 
-	if req.Term > r.currentTerm {
-		r.logger.Debug("req term is greater than current term", zap.Int("reqTerm", req.Term), zap.Int("currentTerm", r.currentTerm))
+	if req.Term > r.term {
+		r.logger.Debug("req term is greater than current term", zap.Int("reqTerm", req.Term), zap.Int("term", r.term))
 		r.becomeFollower(req.Term)
 	}
 
 	resp := &types.RequestVoteResp{
-		Term: r.currentTerm,
+		Term: r.term,
 	}
 
-	if r.currentTerm == req.Term &&
+	if r.term == req.Term &&
 		(r.votedForID == "" || r.votedForID == req.CandidateID) {
 		resp.VoteGranted = true
 		r.votedForID = req.CandidateID
@@ -353,15 +335,18 @@ func (r *raftConsensusModule) handleRequestVote(_ context.Context, req types.Req
 
 // Stop stops raft module
 func (r *raftConsensusModule) Stop() {
-	r.mu.Lock()
-	r.status = RaftStatusDead
-	r.mu.Unlock()
+	r.logger.Info("stopping raft module")
+
+	r.mutex.Lock()
+	r.status = types.RaftStatusDead
+	r.mutex.Unlock()
 
 	if err := r.transport.Stop(); err != nil {
 		r.logger.Error("failed to stop raft transport", zap.Error(err))
 	}
 }
 
+// onBecameLeader adds leader tag to the member tags list
 func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member) {
 	tags := member.Tags
 
@@ -371,12 +356,14 @@ func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member)
 
 	tags[LeaderTagName] = "true"
 
+	m.Config.Tags = tags
 	err := m.serf.SetTags(tags)
 	if err != nil {
-		// log error
+		r.logger.Error("failed to add leader tag to the member tags", zap.Error(err), zap.String("memberName", member.Name))
 	}
 }
 
+// onBecameLeader removes leader tag from the member tags list
 func (r *raftConsensusModule) onBecameFollower(m *Membership, member *serf.Member) {
 	tags := member.Tags
 
@@ -386,13 +373,14 @@ func (r *raftConsensusModule) onBecameFollower(m *Membership, member *serf.Membe
 
 	delete(tags, LeaderTagName)
 
+	m.Config.Tags = tags
 	err := m.serf.SetTags(tags)
 	if err != nil {
-		// log error
+		r.logger.Error("failed to remove leader tag from the member tags", zap.Error(err), zap.String("memberName", member.Name))
 	}
 }
 
-// electionTimeout generates a random election timeout duration.
+// electionTimeout generates a random election timeout duration in range [150,300] milliseconds
 func (r *raftConsensusModule) electionTimeout() time.Duration {
-	return time.Duration(150+randInt64n(int64(150))) * time.Millisecond
+	return (electionTimeout + time.Duration(randInt64n(int64(electionTimeout)))) * time.Millisecond
 }

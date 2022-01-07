@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/serf/serf"
 )
 
+// RaftTransport is a transport layer abstraction
 type RaftTransport interface {
 	SendVoteRequest(ctx context.Context, target serf.Member, msg types.RequestVoteReq) (*types.RequestVoteResp, error)
 	SendLeaderHeartbeat(ctx context.Context, target serf.Member, msg types.LeaderHeartbeatReq) (*types.LeaderHeartbeatResp, error)

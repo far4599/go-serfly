@@ -1,27 +1,22 @@
 package go_serfly
 
 import (
+	"log"
 	"net"
 	"time"
 
+	"github.com/far4599/go-serfly/types"
+	"github.com/google/uuid"
 	"github.com/hashicorp/serf/serf"
 	jsoniter "github.com/json-iterator/go"
 	"go.uber.org/zap"
 )
 
-type opt func(membership *Membership) error
-
 type Config struct {
-	NodeName              string
-	BindAddr              string
-	Tags                  map[string]string
-	KnownClusterAddresses []string
-}
-
-type BroadcastMessageResp struct {
-	RequestName string
-	FromID      string
-	Payload     []byte
+	Name                  string            // cluster member name
+	Addr                  string            // member tcp address ("ip:port")
+	Tags                  map[string]string // member tags
+	KnownClusterAddresses []string          // initial known addresses of cluster members
 }
 
 type Membership struct {
@@ -31,25 +26,28 @@ type Membership struct {
 	raft          *raftConsensusModule
 	raftTransport RaftTransport
 	logger        *zap.Logger
+	serfLogger    *log.Logger
 
 	serviceName string
 
 	eventsCh             chan serf.Event
 	messageListeners     map[string][]func(*Membership, *serf.Query)
-	memberEventListeners map[memberEventType][]func(*Membership, *serf.Member)
+	memberEventListeners map[types.MemberEventType][]func(*Membership, *serf.Member)
 }
 
-func New(config Config, opts ...opt) (*Membership, error) {
+// NewMembership is go-serfly membership constructor
+func NewMembership(config Config, opts ...opt) (*Membership, error) {
 	c := &Membership{
-		Config: config,
-		logger: zap.NewNop(),
+		Config:     config,
+		logger:     zap.NewNop(),
+		serfLogger: zap.NewStdLog(zap.NewNop()),
 
 		messageListeners:     make(map[string][]func(*Membership, *serf.Query)),
-		memberEventListeners: make(map[memberEventType][]func(*Membership, *serf.Member)),
+		memberEventListeners: make(map[types.MemberEventType][]func(*Membership, *serf.Member)),
 	}
 
-	for _, opt := range opts {
-		if err := opt(c); err != nil {
+	for _, optFn := range opts {
+		if err := optFn(c); err != nil {
 			return nil, err
 		}
 	}
@@ -57,8 +55,9 @@ func New(config Config, opts ...opt) (*Membership, error) {
 	return c, nil
 }
 
-func (m *Membership) Serve() (err error) {
-	addr, err := net.ResolveTCPAddr("tcp", m.BindAddr)
+// Serve setups a new cluster member and joins the cluster
+func (m *Membership) Serve() error {
+	addr, err := net.ResolveTCPAddr("tcp", m.Addr)
 	if err != nil {
 		return err
 	}
@@ -69,22 +68,28 @@ func (m *Membership) Serve() (err error) {
 	config.MemberlistConfig.BindAddr = addr.IP.String()
 	config.MemberlistConfig.BindPort = addr.Port
 
-	config.MemberlistConfig.Logger = zap.NewStdLog(zap.NewNop())
-	config.Logger = zap.NewStdLog(zap.NewNop())
+	config.MemberlistConfig.Logger = m.serfLogger
+	config.Logger = m.serfLogger
 
 	m.eventsCh = make(chan serf.Event)
 	config.EventCh = m.eventsCh
 	config.Tags = m.Tags
-	config.NodeName = m.Config.NodeName
+
+	// generate a unique name for the node if not specified
+	if m.Config.Name == "" {
+		name := uuid.New().String()
+		m.Config.Name = name
+	}
+	config.NodeName = m.Config.Name
 
 	m.serf, err = serf.Create(config)
 	if err != nil {
 		return err
 	}
 
-	m.raft = newRaft(m.serf.LocalMember().Name, m, m.raftTransport, m.logger)
-
 	go m.eventHandler()
+
+	m.raft = newRaft(m.serf.LocalMember().Name, m, m.raftTransport, m.logger)
 
 	if m.KnownClusterAddresses != nil {
 		_, err = m.serf.Join(m.KnownClusterAddresses, true)
@@ -96,6 +101,7 @@ func (m *Membership) Serve() (err error) {
 	return nil
 }
 
+// eventHandler handles serf events
 func (m *Membership) eventHandler() {
 	for e := range m.eventsCh {
 		switch e.EventType() {
@@ -105,7 +111,7 @@ func (m *Membership) eventHandler() {
 					continue
 				}
 
-				m.onMemberEventHook(memberEventJoin, &member)
+				m.onMemberEventHook(types.MemberEventJoin, &member)
 			}
 		case serf.EventMemberLeave, serf.EventMemberFailed:
 			for _, member := range e.(serf.MemberEvent).Members {
@@ -113,7 +119,7 @@ func (m *Membership) eventHandler() {
 					return
 				}
 
-				m.onMemberEventHook(memberEventLeave, &member)
+				m.onMemberEventHook(types.MemberEventLeave, &member)
 			}
 		case serf.EventQuery:
 			query, ok := e.(*serf.Query)
@@ -126,7 +132,8 @@ func (m *Membership) eventHandler() {
 	}
 }
 
-func (m *Membership) Broadcast(msgType string, msgPayload interface{}, params *serf.QueryParam) (<-chan BroadcastMessageResp, error) {
+// Broadcast sends query to members, you may specify targets by using filters in params
+func (m *Membership) Broadcast(msgType string, msgPayload interface{}, params *serf.QueryParam) (<-chan types.BroadcastMessageResp, error) {
 	msgJSON, err := jsoniter.Marshal(msgPayload)
 	if err != nil {
 		return nil, err
@@ -148,13 +155,13 @@ func (m *Membership) Broadcast(msgType string, msgPayload interface{}, params *s
 		return nil, err
 	}
 
-	respCh := make(chan BroadcastMessageResp, cap(resp.ResponseCh()))
+	respCh := make(chan types.BroadcastMessageResp, cap(resp.ResponseCh()))
 
 	go func() {
 		defer close(respCh)
 
 		for r := range resp.ResponseCh() {
-			respCh <- BroadcastMessageResp{
+			respCh <- types.BroadcastMessageResp{
 				RequestName: msgType,
 				FromID:      r.From,
 				Payload:     r.Payload,
@@ -165,22 +172,27 @@ func (m *Membership) Broadcast(msgType string, msgPayload interface{}, params *s
 	return respCh, nil
 }
 
+// isLocal checks if node name equals to the local node name
 func (m *Membership) isLocal(name string) bool {
 	return m.serf.LocalMember().Name == name
 }
 
+// IsLeader checks if the local node is a raft leader
 func (m *Membership) IsLeader() bool {
-	return m.raft != nil && m.raft.status == RaftStatusLeader
+	return m.raft != nil && m.raft.status == types.RaftStatusLeader
 }
 
-func (m *Membership) Status() RaftStatus {
+// Status returns raft status
+func (m *Membership) Status() types.RaftStatus {
 	return m.raft.status
 }
 
+// AllMembers returns list of all cluster members (including left or failed)
 func (m *Membership) AllMembers() Members {
 	return m.serf.Members()
 }
 
+// ServiceMembers returns list of cluster members with the same service name as local node
 func (m *Membership) ServiceMembers() Members {
 	var mm Members = m.serf.Members()
 
@@ -191,6 +203,7 @@ func (m *Membership) ServiceMembers() Members {
 	return mm.GetService(m.serviceName)
 }
 
+// Stop stops the membership service. Will result the local node to leave the cluster
 func (m *Membership) Stop() error {
 	if m.raft != nil {
 		m.raft.Stop()

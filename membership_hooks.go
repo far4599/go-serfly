@@ -1,22 +1,17 @@
 package go_serfly
 
-import "github.com/hashicorp/serf/serf"
-
-type memberEventType int
-
-const (
-	memberEventJoin memberEventType = iota
-	memberEventLeave
-	memberEventBecameFollower
-	memberEventBecameCandidate
-	memberEventBecameLeader
+import (
+	"github.com/far4599/go-serfly/types"
+	"github.com/hashicorp/serf/serf"
 )
 
+// AddMessageListener adds a callback to handle a query message sent by Broadcast method
 func (m *Membership) AddMessageListener(msgType string, cb func(*Membership, *serf.Query)) {
 	m.messageListeners[msgType] = append(m.messageListeners[msgType], cb)
 }
 
-func (m *Membership) AddMemberEventListener(eventType memberEventType, cb func(*Membership, *serf.Member)) {
+// AddMemberEventListener adds a callback to handle member's raft status change
+func (m *Membership) AddMemberEventListener(eventType types.MemberEventType, cb func(*Membership, *serf.Member)) {
 	m.memberEventListeners[eventType] = append(m.memberEventListeners[eventType], cb)
 }
 
@@ -26,7 +21,7 @@ func (m *Membership) onMessageHook(msgType string, query *serf.Query) {
 	}
 }
 
-func (m *Membership) onMemberEventHook(eventType memberEventType, member *serf.Member) {
+func (m *Membership) onMemberEventHook(eventType types.MemberEventType, member *serf.Member) {
 	if member == nil {
 		_m := m.serf.LocalMember()
 		member = &_m

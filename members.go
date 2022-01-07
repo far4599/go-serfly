@@ -7,12 +7,15 @@ const (
 	ServiceTagName = "service"
 )
 
+// Members is a list of cluster members
 type Members []serf.Member
 
+// Count counts cluster members in the list
 func (mm Members) Count() int {
 	return len(mm)
 }
 
+// CountActive counts only active (healthy) cluster members
 func (mm Members) CountActive() int {
 	var count int
 
@@ -25,6 +28,7 @@ func (mm Members) CountActive() int {
 	return count
 }
 
+// Active filters the list and returns a list of only active cluster members
 func (mm Members) Active() Members {
 	var members []serf.Member
 
@@ -37,6 +41,7 @@ func (mm Members) Active() Members {
 	return members
 }
 
+// GetService returns a list of cluster members of certain service
 func (mm Members) GetService(serviceName string) Members {
 	var members []serf.Member
 
@@ -49,6 +54,7 @@ func (mm Members) GetService(serviceName string) Members {
 	return members
 }
 
+// GetLeader returns the first member of the cluster with leader tag
 func (mm Members) GetLeader() *serf.Member {
 	for _, member := range mm {
 		if _, ok := member.Tags[LeaderTagName]; ok {
