@@ -1,4 +1,4 @@
-package go_serfly
+package types
 
 import "github.com/hashicorp/serf/serf"
 

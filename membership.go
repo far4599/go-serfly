@@ -22,11 +22,12 @@ type Config struct {
 type Membership struct {
 	Config
 
-	serf          *serf.Serf
-	raft          *raftConsensusModule
-	raftTransport RaftTransport
-	logger        *zap.Logger
-	serfLogger    *log.Logger
+	serf                          *serf.Serf
+	raft                          *raftConsensusModule
+	raftTransport                 RaftTransport
+	raftSingleNodeCanBecomeLeader bool
+	logger                        *zap.Logger
+	serfLogger                    *log.Logger
 
 	serviceName string
 
@@ -89,7 +90,7 @@ func (m *Membership) Serve() error {
 
 	go m.eventHandler()
 
-	m.raft = newRaft(m.serf.LocalMember().Name, m, m.raftTransport, m.logger)
+	m.raft = newRaft(m.serf.LocalMember().Name, m, m.raftTransport, m.logger, m.raftSingleNodeCanBecomeLeader)
 
 	if m.KnownClusterAddresses != nil {
 		_, err = m.serf.Join(m.KnownClusterAddresses, true)
@@ -147,7 +148,7 @@ func (m *Membership) Broadcast(msgType string, msgPayload interface{}, params *s
 	}
 
 	if params.FilterTags == nil && m.serviceName != "" {
-		params.FilterTags = map[string]string{ServiceTagName: m.serviceName}
+		params.FilterTags = map[string]string{types.ServiceTagName: m.serviceName}
 	}
 
 	resp, err := m.serf.Query(msgType, msgJSON, params)
@@ -188,13 +189,13 @@ func (m *Membership) Status() types.RaftStatus {
 }
 
 // AllMembers returns list of all cluster members (including left or failed)
-func (m *Membership) AllMembers() Members {
+func (m *Membership) AllMembers() types.Members {
 	return m.serf.Members()
 }
 
 // ServiceMembers returns list of cluster members with the same service name as local node
-func (m *Membership) ServiceMembers() Members {
-	var mm Members = m.serf.Members()
+func (m *Membership) ServiceMembers() types.Members {
+	var mm types.Members = m.serf.Members()
 
 	if m.serviceName == "" {
 		return mm

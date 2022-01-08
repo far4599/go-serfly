@@ -2,19 +2,37 @@ package go_serfly
 
 import (
 	"fmt"
+	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/far4599/go-serfly/transport"
 	"github.com/hashicorp/serf/serf"
-	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
 )
 
-func setupMember(t *testing.T, members []*Membership, port, transportPort int, serviceName string) []*Membership {
+func TestMembershipTestSuite(t *testing.T) {
+	suite.Run(t, new(MembershipTestSuite))
+}
+
+type MembershipTestSuite struct {
+	suite.Suite
+
+	lastUsedPort   int
+	portProbeMutex sync.Mutex
+	logger         *zap.Logger
+}
+
+func (s *MembershipTestSuite) SetupSuite() {
+	s.lastUsedPort = 10000
+}
+
+func (s *MembershipTestSuite) setupMember(members []*Membership, serviceName string, startedAt time.Time, opts []opt) []*Membership {
 	id := len(members)
-	addr := fmt.Sprintf("%s:%d", "127.0.0.1", port)
+	addr := fmt.Sprintf("%s:%d", "127.0.0.1", s.getNextFreePort())
 	c := Config{
 		Name: fmt.Sprintf("%d", id),
 		Addr: addr,
@@ -26,9 +44,7 @@ func setupMember(t *testing.T, members []*Membership, port, transportPort int, s
 		}
 	}
 
-	startedAt := time.Now()
-
-	on := func(id, role string) func(*Membership, *serf.Member) {
+	onBecameEvent := func(id, role string) func(*Membership, *serf.Member) {
 		return func(m *Membership, _ *serf.Member) {
 			svc := m.serviceName
 			if svc != "" {
@@ -36,85 +52,139 @@ func setupMember(t *testing.T, members []*Membership, port, transportPort int, s
 			}
 
 			if role == "leader" {
-				fmt.Printf("==> %s%s became %s on %s\n", svc, id, role, time.Now().Sub(startedAt).String())
-			} else {
-				fmt.Printf("%s%s became %s on %s\n", svc, id, role, time.Now().Sub(startedAt).String())
+				svc = "==> " + svc
 			}
+
+			s.logger.Debug(fmt.Sprintf("%s%s became %s on %s\n", svc, id, role, time.Now().Sub(startedAt).String()))
+		}
+	}
+
+	onMemberEvent := func(id, action string) func(*Membership, *serf.Member) {
+		return func(m *Membership, _ *serf.Member) {
+			//svc := m.serviceName
+			//if svc != "" {
+			//	svc = svc + " node:"
+			//}
+			//
+			//a := "joined"
+			//if action == "leave" {
+			//	a = "left"
+			//}
+			//
+			//logger.Debug(fmt.Sprintf("%s%s %s cluster on %s\n", svc, id, a, time.Now().Sub(startedAt).String()))
 		}
 	}
 
 	i := strconv.Itoa(id)
 
-	logger, err := zap.NewDevelopment()
-	require.NoError(t, err)
+	tr := transport.NewHttpTransport("127.0.0.1", s.getNextFreePort(), nil, s.logger)
 
-	tr := transport.NewHttpTransport("127.0.0.1", transportPort, nil, logger)
+	basicOpts := []opt{WithServiceName(serviceName), WithRaftTransport(tr), WithLogger(s.logger), WithSerfLogger(zap.NewNop()), WithOnBecomeLeaderCallback(onBecameEvent(i, "leader")), WithOnBecomeFollowerCallback(onBecameEvent(i, "follower")), WithOnBecomeCandidateCallback(onBecameEvent(i, "candidate")), WithOnMemberJoinCallback(onMemberEvent(i, "join")), WithOnMemberLeaveCallback(onMemberEvent(i, "leave"))}
 
-	m, err := NewMembership(c, WithOnBecomeLeaderCallback(on(i, "leader")), WithOnBecomeFollowerCallback(on(i, "follower")), WithOnBecomeCandidateCallback(on(i, "candidate")), WithLogger(logger), WithServiceName(serviceName), WithRaftTransport(tr))
-	require.NoError(t, err)
+	opts = append(basicOpts, opts...)
+
+	m, err := NewMembership(c, opts...)
+	s.Require().NoError(err)
 
 	err = m.Serve()
-	require.NoError(t, err)
+	s.Require().NoError(err)
 
 	members = append(members, m)
 
 	return members
 }
 
-// TestMembershipOneNode tests that is there only one node it will never become a leader
-func TestMembershipOneNode(t *testing.T) {
-	t.Parallel()
+func (s *MembershipTestSuite) getNextFreePort() int {
+	s.portProbeMutex.Lock()
+	defer s.portProbeMutex.Unlock()
+
+	for port := s.lastUsedPort + 1; port < (1 << 16); port++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+
+		s.lastUsedPort = port
+		return port
+	}
+
+	return -1
+}
+
+// TestMembershipOneNode tests that if there is only one node it will never become a leader
+func (s *MembershipTestSuite) TestMembershipOneNode() {
+	s.T().Parallel()
 
 	nodesCount := 1
-	initPort := int(50000 + randInt64n(1000))
+	startedAt := time.Now()
 
-	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
+	m := s.setupMember(nil, "", startedAt, nil)
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
+		m = s.setupMember(m, "", startedAt, nil)
 	}
 
 	// check leader must never not be elected
-	require.Never(t, func() bool {
+	s.Require().Never(func() bool {
 		return m[0].ServiceMembers().GetLeader() != nil
 	}, 5*time.Second, 250*time.Millisecond)
 }
 
-func TestMembershipTwoNodes(t *testing.T) {
-	t.Parallel()
+// TestMembershipOneNode tests that if there is only one node it will never become a leader
+func (s *MembershipTestSuite) TestMembershipOneNodeWithEnabledSingleNodeCanBecomeLeader() {
+	s.T().Parallel()
 
-	nodesCount := 3
-	initPort := int(51500 + randInt64n(500))
+	nodesCount := 1
+	startedAt := time.Now()
 
-	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
+	m := s.setupMember(nil, "", startedAt, []opt{WithSingleNodeCanBecomeLeader()})
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
+		m = s.setupMember(m, "", startedAt, nil)
+	}
+
+	// check leader must never not be elected
+	s.Require().Eventually(func() bool {
+		return m[0].ServiceMembers().GetLeader() != nil
+	}, 5*time.Second, 250*time.Millisecond)
+}
+
+func (s *MembershipTestSuite) TestMembershipTwoNodes() {
+	s.T().Parallel()
+
+	nodesCount := 2
+	startedAt := time.Now()
+
+	m := s.setupMember(nil, "", startedAt, nil)
+	for i := 1; i < nodesCount; i++ {
+		m = s.setupMember(m, "", startedAt, nil)
 	}
 
 	// check if leader is elected
-	require.Eventually(t, func() bool {
+	s.Require().Eventually(func() bool {
 		return m[0].ServiceMembers().GetLeader() != nil
-	}, 60*time.Second, 250*time.Millisecond)
+	}, 5*time.Second, 250*time.Millisecond)
 }
 
-func TestMembershipThreeNodes(t *testing.T) {
-	t.Parallel()
+// TestMembershipThreeNodes will create three node cluster, then the leader will leave the cluster after 1 sec from been elected, and a new leader must be elected
+func (s *MembershipTestSuite) TestMembershipThreeNodes() {
+	s.T().Parallel()
 
 	nodesCount := 3
-	initPort := int(51000 + randInt64n(1000))
+	startedAt := time.Now()
 
-	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
+	m := s.setupMember(nil, "", startedAt, nil)
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
+		m = s.setupMember(m, "", startedAt, nil)
 	}
 
 	sampleM := m[0]
 
 	// check if leader is elected
-	require.Eventually(t, func() bool {
+	s.Require().Eventually(func() bool {
 		return sampleM.ServiceMembers().GetLeader() != nil
-	}, 60*time.Second, 250*time.Millisecond)
+	}, 5*time.Second, 250*time.Millisecond)
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(1 * time.Second)
 
 	leader := m[0].ServiceMembers().GetLeader()
 	for _, membership := range m {
@@ -123,7 +193,7 @@ func TestMembershipThreeNodes(t *testing.T) {
 
 			// leader leaves the cluster
 			err := membership.Stop()
-			require.NoError(t, err)
+			s.Require().NoError(err)
 
 			if sampleM == membership {
 				sampleM = m[1]
@@ -134,50 +204,51 @@ func TestMembershipThreeNodes(t *testing.T) {
 	}
 
 	// check if a new leader is elected
-	require.Eventually(t, func() bool {
+	s.Require().Eventually(func() bool {
 		return sampleM.ServiceMembers().GetLeader() != nil
-	}, 60*time.Second, 250*time.Millisecond)
+	}, 5*time.Second, 250*time.Millisecond)
 }
 
-func TestMembershipManyNodes(t *testing.T) {
-	t.Parallel()
+func (s *MembershipTestSuite) TestMembershipManyNodes() {
+	s.T().Parallel()
 
 	nodesCount := 15 // the more nodes in the cluster, the longer test will last
-	initPort := int(52000 + randInt64n(1000))
+	startedAt := time.Now()
 
-	m := setupMember(t, nil, initPort, initPort+nodesCount, "")
+	m := s.setupMember(nil, "", startedAt, nil)
 	for i := 1; i < nodesCount; i++ {
-		m = setupMember(t, m, initPort+i, initPort+i+nodesCount, "")
+		m = s.setupMember(m, "", startedAt, nil)
 	}
 
 	// check if leader is elected
-	require.Eventually(t, func() bool {
+	s.Require().Eventually(func() bool {
 		return m[0].ServiceMembers().GetLeader() != nil
-	}, 60*time.Second, 250*time.Millisecond)
+	}, 5*time.Second, 250*time.Millisecond)
 }
 
-func TestMembershipThreeServices(t *testing.T) {
-	t.Parallel()
+func (s *MembershipTestSuite) TestMembershipThreeServices() {
+	s.T().Parallel()
 
 	nodesCount := 3
+	startedAt := time.Now()
+
 	serviceCount := 5
-	initPort := int(53000 + randInt64n(1000))
 	serviceMap := make(map[string]struct{}, serviceCount)
 
 	var m []*Membership
 	p := 0
 	for i := 0; i < serviceCount; i++ {
-		s := fmt.Sprintf("%s-%d", "service", i)
-		serviceMap[s] = struct{}{}
+		svc := fmt.Sprintf("%s-%d", "service", i)
+		serviceMap[svc] = struct{}{}
 
 		for j := 0; j < nodesCount; j++ {
-			m = setupMember(t, m, initPort+p, initPort+p+nodesCount*serviceCount, s)
+			m = s.setupMember(m, svc, startedAt, nil)
 			p++
 		}
 	}
 
 	// check if all services elected leader
-	require.Eventually(t, func() bool {
+	s.Require().Eventually(func() bool {
 		result := true
 
 		for s := range serviceMap {
@@ -187,5 +258,5 @@ func TestMembershipThreeServices(t *testing.T) {
 		}
 
 		return result
-	}, 60*time.Second, 250*time.Millisecond)
+	}, 5*time.Second, 250*time.Millisecond)
 }

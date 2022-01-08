@@ -32,12 +32,14 @@ type raftConsensusModule struct {
 	electionResetTime time.Time // the last time we reset election timer
 	status            types.RaftStatus
 
+	singleNodeCanBecomeLeader bool
+
 	logger *zap.Logger
 	mutex  sync.Mutex
 }
 
 // newRaft is a constructor of a new raft consensus module
-func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger) *raftConsensusModule {
+func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger, singleNodeCanBecomeLeader bool) *raftConsensusModule {
 	if l == nil {
 		l = zap.NewNop()
 	}
@@ -47,13 +49,14 @@ func newRaft(name string, m *Membership, t RaftTransport, l *zap.Logger) *raftCo
 	}
 
 	r := &raftConsensusModule{
-		id:         name,
-		term:       -1,
-		votedForID: "",
-		status:     types.RaftStatusFollower,
-		membership: m,
-		transport:  t,
-		logger:     l,
+		id:                        name,
+		term:                      -1,
+		votedForID:                "",
+		status:                    types.RaftStatusFollower,
+		membership:                m,
+		transport:                 t,
+		singleNodeCanBecomeLeader: singleNodeCanBecomeLeader,
+		logger:                    l,
 	}
 
 	// custom handler for local member events
@@ -135,7 +138,7 @@ func (r *raftConsensusModule) startElection() {
 	peers := r.membership.ServiceMembers().Active()
 
 	// if member is alone, it cannot become a leader
-	if len(peers) <= 1 {
+	if len(peers) <= 1 && !r.singleNodeCanBecomeLeader {
 		return
 	}
 
@@ -147,13 +150,18 @@ func (r *raftConsensusModule) startElection() {
 
 	go r.membership.onMemberEventHook(types.MemberEventBecameCandidate, nil)
 
+	// if node is single in the cluster, it becomes leader immediately
+	if len(peers) == 1 && r.singleNodeCanBecomeLeader {
+		r.startLeader()
+		return
+	}
+
 	req := types.RequestVoteReq{
 		Term:        newTerm,
 		CandidateID: r.id,
 	}
 
-	var votesCount atomic.Uint32
-	votesCount.Store(1)
+	votesCount := atomic.NewUint32(1)
 	for _, peer := range peers {
 		if peer.Name == r.id {
 			continue
@@ -354,11 +362,11 @@ func (r *raftConsensusModule) onBecameLeader(m *Membership, member *serf.Member)
 		tags = make(map[string]string)
 	}
 
-	tags[LeaderTagName] = "true"
+	tags[types.LeaderTagName] = "true"
 
 	m.Config.Tags = tags
 	err := m.serf.SetTags(tags)
-	if err != nil {
+	if err != nil && r.status != types.RaftStatusDead {
 		r.logger.Error("failed to add leader tag to the member tags", zap.Error(err), zap.String("memberName", member.Name))
 	}
 }
@@ -369,9 +377,11 @@ func (r *raftConsensusModule) onBecameFollower(m *Membership, member *serf.Membe
 
 	if tags == nil {
 		return
+	} else if _, ok := tags[types.LeaderTagName]; !ok {
+		return
 	}
 
-	delete(tags, LeaderTagName)
+	delete(tags, types.LeaderTagName)
 
 	m.Config.Tags = tags
 	err := m.serf.SetTags(tags)
