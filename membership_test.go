@@ -27,6 +27,7 @@ type MembershipTestSuite struct {
 }
 
 func (s *MembershipTestSuite) SetupSuite() {
+	s.logger, _ = zap.NewDevelopment()
 	s.lastUsedPort = 10000
 }
 
