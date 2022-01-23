@@ -80,11 +80,11 @@ func (s *MembershipTestSuite) setupMember(members []*Membership, serviceName str
 
 	tr := transport.NewHttpTransport("127.0.0.1", s.getNextFreePort(), nil, s.logger)
 
-	basicOpts := []opt{WithServiceName(serviceName), WithRaftTransport(tr), WithLogger(s.logger), WithSerfLogger(zap.NewNop()), WithOnBecomeLeaderCallback(onBecameEvent(i, "leader")), WithOnBecomeFollowerCallback(onBecameEvent(i, "follower")), WithOnBecomeCandidateCallback(onBecameEvent(i, "candidate")), WithOnMemberJoinCallback(onMemberEvent(i, "join")), WithOnMemberLeaveCallback(onMemberEvent(i, "leave"))}
+	basicOpts := []opt{WithServiceName(serviceName), WithLogger(s.logger), WithSerfLogger(zap.NewNop()), WithOnBecomeLeaderCallback(onBecameEvent(i, "leader")), WithOnBecomeFollowerCallback(onBecameEvent(i, "follower")), WithOnBecomeCandidateCallback(onBecameEvent(i, "candidate")), WithOnMemberJoinCallback(onMemberEvent(i, "join")), WithOnMemberLeaveCallback(onMemberEvent(i, "leave"))}
 
 	opts = append(basicOpts, opts...)
 
-	m, err := NewMembership(c, opts...)
+	m, err := NewMembership(c, tr, opts...)
 	s.Require().NoError(err)
 
 	err = m.Serve()

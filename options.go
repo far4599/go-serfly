@@ -36,15 +36,6 @@ func WithServiceName(serviceName string) func(membership *Membership) error {
 	}
 }
 
-// WithRaftTransport sets raft transport implementation
-func WithRaftTransport(t RaftTransport) func(membership *Membership) error {
-	return func(membership *Membership) error {
-		membership.raftTransport = t
-		membership.Config.Tags = t.AddTransportTags(membership.Config.Tags)
-		return nil
-	}
-}
-
 // WithSingleNodeCanBecomeLeader sets that single node can become a leader, by default it cannot
 func WithSingleNodeCanBecomeLeader() func(membership *Membership) error {
 	return func(membership *Membership) error {

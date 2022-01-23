@@ -37,11 +37,18 @@ type Membership struct {
 }
 
 // NewMembership is go-serfly membership constructor
-func NewMembership(config Config, opts ...opt) (*Membership, error) {
+func NewMembership(config Config, rt RaftTransport, opts ...opt) (*Membership, error) {
+	if rt == nil {
+		log.Fatal("raft transport implementation is not provided")
+	}
+
+	config.Tags = rt.AddTransportTags(config.Tags)
+
 	c := &Membership{
-		Config:     config,
-		logger:     zap.NewNop(),
-		serfLogger: zap.NewStdLog(zap.NewNop()),
+		Config:        config,
+		raftTransport: rt,
+		logger:        zap.NewNop(),
+		serfLogger:    zap.NewStdLog(zap.NewNop()),
 
 		messageListeners:     make(map[string][]func(*Membership, *serf.Query)),
 		memberEventListeners: make(map[types.MemberEventType][]func(*Membership, *serf.Member)),
@@ -185,6 +192,10 @@ func (m *Membership) IsLeader() bool {
 
 // Status returns raft status
 func (m *Membership) Status() types.RaftStatus {
+	if m.raft == nil {
+		return types.RaftStatusDead
+	}
+
 	return m.raft.status
 }
 
