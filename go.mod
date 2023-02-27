@@ -1,6 +1,6 @@
 module github.com/far4599/go-serfly
 
-go 1.17
+go 1.19
 
 require (
 	github.com/google/uuid v1.3.0
